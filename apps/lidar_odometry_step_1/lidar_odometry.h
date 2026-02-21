@@ -30,7 +30,8 @@ void calculate_trajectory(
     bool fusionConventionNed,
     double ahrs_gain,
     bool debugMsg,
-    bool use_removie_imu_bias_from_first_stationary_scan);
+    bool use_removie_imu_bias_from_first_stationary_scan,
+    std::vector<FusionQuaternion>* ahrs_quats_out = nullptr);
 bool compute_step_1(
     const std::vector<std::vector<Point3Di>>& pointsPerFile,
     LidarOdometryParams& params,

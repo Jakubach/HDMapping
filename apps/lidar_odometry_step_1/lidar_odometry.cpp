@@ -323,9 +323,15 @@ void calculate_trajectory(
     bool fusionConventionNed,
     double ahrs_gain,
     bool debugMsg,
-    bool use_remove_imu_bias_from_first_stationary_scan)
+    bool use_remove_imu_bias_from_first_stationary_scan,
+    std::vector<FusionQuaternion>* ahrs_quats_out)
 {
     UTL_PROFILER_SCOPE("calculate_trajectory");
+    if (ahrs_quats_out)
+    {
+        ahrs_quats_out->clear();
+        ahrs_quats_out->reserve(imu_data.size());
+    }
     FusionAhrs ahrs;
     FusionAhrsInitialise(&ahrs);
 
@@ -444,6 +450,8 @@ void calculate_trajectory(
         last_ts = timestamp_pair.first;
 
         FusionQuaternion quat = FusionAhrsGetQuaternion(&ahrs);
+        if (ahrs_quats_out)
+            ahrs_quats_out->push_back(quat);
 
         Eigen::Quaterniond d{ quat.element.w, quat.element.x, quat.element.y, quat.element.z };
         Eigen::Affine3d t{ Eigen::Matrix4d::Identity() };
@@ -1103,6 +1111,7 @@ std::vector<WorkerData> run_lidar_odometry(const std::string& input_dir, LidarOd
         return worker_data;
     }
     Trajectory trajectory;
+    std::vector<FusionQuaternion> ahrs_quats;
     calculate_trajectory(
         trajectory,
         imu_data,
@@ -1111,7 +1120,8 @@ std::vector<WorkerData> run_lidar_odometry(const std::string& input_dir, LidarOd
         params.fusionConventionNed,
         params.ahrs_gain,
         true,
-        params.use_removie_imu_bias_from_first_stationary_scan);
+        params.use_removie_imu_bias_from_first_stationary_scan,
+        &ahrs_quats);
 
     std::atomic<bool> pause{ false };
 
@@ -1124,7 +1134,7 @@ std::vector<WorkerData> run_lidar_odometry(const std::string& input_dir, LidarOd
 
     std::atomic<float> loProgress;
 
-    if (!compute_step_2(worker_data, params, ts_failure, loProgress, pause, true))
+    if (!compute_step_2(worker_data, params, ts_failure, loProgress, pause, true, &imu_data, &ahrs_quats))
     {
         std::cout << "Calculation failed at step 2 of lidar odometry, exiting." << std::endl;
 

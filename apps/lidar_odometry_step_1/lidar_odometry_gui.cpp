@@ -180,6 +180,7 @@ Session session;
 std::vector<std::vector<Point3Di>> pointsPerFile;
 Imu imu_data;
 Trajectory trajectory;
+std::vector<FusionQuaternion> ahrs_quats;
 std::atomic<bool> loRunning{ false };
 std::atomic<float> loProgress{ 0.0 };
 std::atomic<bool> loPause{ false };
@@ -634,7 +635,8 @@ void step1(const std::atomic<bool>& loPause)
                 params.fusionConventionNed,
                 params.ahrs_gain,
                 full_debug_messages,
-                params.use_removie_imu_bias_from_first_stationary_scan);
+                params.use_removie_imu_bias_from_first_stationary_scan,
+                &ahrs_quats);
             compute_step_1(pointsPerFile, params, trajectory, worker_data, loPause);
             step_1_done = true;
         }
@@ -654,7 +656,7 @@ void step1(const std::atomic<bool>& loPause)
 void step2(const std::atomic<bool>& loPause)
 {
     double ts_failure = 0.0;
-    if (compute_step_2(worker_data, params, ts_failure, loProgress, loPause, full_debug_messages))
+    if (compute_step_2(worker_data, params, ts_failure, loProgress, loPause, full_debug_messages, &imu_data, &ahrs_quats))
         step_2_done = true;
     else
     {
@@ -1643,7 +1645,8 @@ void step1(
             params.fusionConventionNed,
             params.ahrs_gain,
             full_debug_messages,
-            params.use_removie_imu_bias_from_first_stationary_scan);
+            params.use_removie_imu_bias_from_first_stationary_scan,
+            &ahrs_quats);
         compute_step_1(pointsPerFile, params, trajectory, worker_data, loPause);
         std::cout << "step_1_done" << std::endl;
     }
@@ -1653,7 +1656,7 @@ void step2(std::vector<WorkerData>& worker_data, LidarOdometryParams& params, co
 {
     double ts_failure = 0.0;
     std::atomic<float> loProgress;
-    compute_step_2(worker_data, params, ts_failure, loProgress, loPause, full_debug_messages);
+    compute_step_2(worker_data, params, ts_failure, loProgress, loPause, full_debug_messages, &imu_data, &ahrs_quats);
 }
 
 void save_results(

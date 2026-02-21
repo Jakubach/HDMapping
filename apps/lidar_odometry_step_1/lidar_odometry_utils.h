@@ -309,7 +309,9 @@ bool compute_step_2(
     double& ts_failure,
     std::atomic<float>& loProgress,
     const std::atomic<bool>& pause,
-    bool debugMsg);
+    bool debugMsg,
+    const std::vector<std::tuple<std::pair<double, double>, FusionVector, FusionVector>>* imu_data = nullptr,
+    const std::vector<FusionQuaternion>* ahrs_quats = nullptr);
 void compute_step_2_fast_forward_motion(std::vector<WorkerData>& worker_data, LidarOdometryParams& params);
 
 // for reconstructing worker data from step 1 output

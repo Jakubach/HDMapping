@@ -1,5 +1,7 @@
 #include "lidar_odometry_utils.h"
 #include <UTL/profiler.hpp>
+#include <fstream>
+#include <iomanip>
 #include <hash_utils.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/stopwatch.h>
@@ -2254,7 +2256,9 @@ bool compute_step_2(
     double& ts_failure,
     std::atomic<float>& loProgress,
     const std::atomic<bool>& pause,
-    bool debugMsg)
+    bool debugMsg,
+    const std::vector<std::tuple<std::pair<double, double>, FusionVector, FusionVector>>* imu_data,
+    const std::vector<FusionQuaternion>* ahrs_quats)
 {
     // exit(1);
     bool debug = false;
@@ -2317,6 +2321,87 @@ bool compute_step_2(
             fs::create_directory(params.working_directory_preview);
         }
 
+        // --- AHRS heading per worker + export quaternions for PyPose (from calculate_trajectory) ---
+        std::vector<double> ahrs_heading_per_worker(worker_data.size(), 0.0);
+
+        if (ahrs_quats != nullptr && imu_data != nullptr && !imu_data->empty() && !worker_data.empty())
+        {
+            spdlog::info("AHRS: Using {} pre-computed quaternions for {} workers",
+                         ahrs_quats->size(), worker_data.size());
+
+            // Extract heading per worker from pre-computed AHRS quaternions
+            size_t imu_idx = 0;
+            for (int wi = 0; wi < (int)worker_data.size(); wi++)
+            {
+                if (worker_data[wi].intermediate_trajectory_timestamps.empty())
+                    continue;
+
+                double t_end = worker_data[wi].intermediate_trajectory_timestamps.back().first;
+
+                while (imu_idx < imu_data->size())
+                {
+                    const auto& [ts_pair, gyr, acc] = (*imu_data)[imu_idx];
+                    if (ts_pair.first > t_end)
+                        break;
+                    imu_idx++;
+                }
+
+                // Last IMU sample before t_end
+                size_t last_idx = (imu_idx > 0) ? (imu_idx - 1) : 0;
+                if (last_idx < ahrs_quats->size())
+                {
+                    FusionEuler euler = FusionQuaternionToEuler((*ahrs_quats)[last_idx]);
+                    ahrs_heading_per_worker[wi] = euler.angle.yaw;
+                }
+            }
+
+            // Export raw IMU + AHRS quaternion to CSV for PyPose
+            {
+                std::ofstream imu_csv("imu_raw_for_pypose.csv");
+                imu_csv << "timestamp,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,qw,qx,qy,qz\n";
+                imu_csv << std::fixed << std::setprecision(9);
+                for (size_t i = 0; i < imu_data->size(); i++)
+                {
+                    const auto& [ts_pair, gyr, acc] = (*imu_data)[i];
+                    const auto& q = (i < ahrs_quats->size()) ? (*ahrs_quats)[i] : FusionQuaternion{.element = {1, 0, 0, 0}};
+                    imu_csv << ts_pair.first << ","
+                            << acc.axis.x << "," << acc.axis.y << "," << acc.axis.z << ","
+                            << gyr.axis.x << "," << gyr.axis.y << "," << gyr.axis.z << ","
+                            << q.element.w << "," << q.element.x << "," << q.element.y << "," << q.element.z << "\n";
+                }
+                spdlog::info("AHRS: Exported {} IMU samples with AHRS quaternion to imu_raw_for_pypose.csv", imu_data->size());
+            }
+        }
+
+        // Load IMU-derived mean_shift from CSV (SM magnitude + AHRS heading)
+        std::map<int, Eigen::Vector3d> imu_mean_shift_map;
+        {
+            std::ifstream ifs("imu_mean_shift.csv");
+            if (ifs.good())
+            {
+                std::string header;
+                std::getline(ifs, header);
+                int wi;
+                double dx, dy, dz;
+                char comma;
+                while (ifs >> wi >> comma >> dx >> comma >> dy >> comma >> dz)
+                {
+                    imu_mean_shift_map[wi] = Eigen::Vector3d(dx, dy, dz);
+                }
+                spdlog::info("IMU_MEAN_SHIFT: Loaded {} workers from imu_mean_shift.csv", imu_mean_shift_map.size());
+            }
+            else
+            {
+                spdlog::warn("IMU_MEAN_SHIFT: imu_mean_shift.csv not found, using original mean_shift");
+            }
+        }
+
+        // Open CSV for mean_shift + AHRS heading
+        std::ofstream mean_shift_csv("mean_shift_vs_imu.csv");
+        mean_shift_csv << "worker,t_start,t_end,"
+                       << "ms_x,ms_y,ms_z,ms_mag,ms_heading_deg,"
+                       << "ahrs_heading_deg\n";
+
         for (int i = 0; i < worker_data.size(); i++)
         {
             UTL_PROFILER_BEGIN(before_iter, "before_iterations");
@@ -2336,22 +2421,23 @@ bool compute_step_2(
             Eigen::Vector3d mean_shift(0.0, 0.0, 0.0);
             if (i > 1 && params.use_motion_from_previous_step)
             {
-                // mean_shift = worker_data[i - 1].intermediate_trajectory[0].translation() - worker_data[i -
-                // 2].intermediate_trajectory[worker_data[i - 2].intermediate_trajectory.size() - 1].translation(); mean_shift /=
-                // ((worker_data[i - 2].intermediate_trajectory.size()) - 2);
-
-                mean_shift =
-                    worker_data[i - 1].intermediate_trajectory[worker_data[i - 1].intermediate_trajectory.size() - 1].translation() -
-                    worker_data[i - 2].intermediate_trajectory[worker_data[i - 2].intermediate_trajectory.size() - 1].translation();
-                // mean_shift = worker_data[i - 1].intermediate_trajectory[0].translation() -
-                //               worker_data[i - 2].intermediate_trajectory[0].translation();
-
-                mean_shift /= (worker_data[i - 1].intermediate_trajectory.size());
-
-                if (mean_shift.norm() > 1.0)
+                if (imu_mean_shift_map.count(i) > 0)
                 {
-                    spdlog::warn("mean_shift.norm() > 1.0");
-                    mean_shift = Eigen::Vector3d(0.0, 0.0, 0.0);
+                    int n_poses = (int)worker_data[i].intermediate_trajectory.size();
+                    mean_shift = imu_mean_shift_map[i] / std::max(n_poses, 1);
+                }
+                else
+                {
+                    mean_shift =
+                        worker_data[i - 1].intermediate_trajectory[worker_data[i - 1].intermediate_trajectory.size() - 1].translation() -
+                        worker_data[i - 2].intermediate_trajectory[worker_data[i - 2].intermediate_trajectory.size() - 1].translation();
+                    mean_shift /= (worker_data[i - 1].intermediate_trajectory.size());
+
+                    if (mean_shift.norm() > 1.0)
+                    {
+                        spdlog::warn("mean_shift.norm() > 1.0");
+                        mean_shift = Eigen::Vector3d(0.0, 0.0, 0.0);
+                    }
                 }
 
                 std::vector<Eigen::Affine3d> new_trajectory;
@@ -2373,6 +2459,28 @@ bool compute_step_2(
 
                 worker_data[i].intermediate_trajectory = new_trajectory;
                 worker_data[i].intermediate_trajectory_motion_model = new_trajectory;
+            }
+
+            // Log mean_shift + AHRS heading to CSV
+            {
+                int n_poses = (int)worker_data[i].intermediate_trajectory.size();
+                Eigen::Vector3d ms_total = mean_shift * n_poses;
+                double ms_mag = ms_total.norm();
+                double ms_heading = std::atan2(ms_total.y(), ms_total.x()) * 180.0 / M_PI;
+
+                double t_start = worker_data[i].intermediate_trajectory_timestamps.empty() ? 0.0
+                    : worker_data[i].intermediate_trajectory_timestamps.front().first;
+                double t_end = worker_data[i].intermediate_trajectory_timestamps.empty() ? 0.0
+                    : worker_data[i].intermediate_trajectory_timestamps.back().first;
+
+                mean_shift_csv << i << "," << std::fixed << std::setprecision(9)
+                               << t_start << "," << t_end << ","
+                               << ms_total.x() << "," << ms_total.y() << "," << ms_total.z() << ","
+                               << ms_mag << "," << ms_heading << ","
+                               << ahrs_heading_per_worker[i] << "\n";
+
+                if (i % 200 == 0)
+                    mean_shift_csv.flush();
             }
 
             bool add_pitch_roll_constraint = false;
